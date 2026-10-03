@@ -1,0 +1,35 @@
+services:
+  - type: web
+    name: skillforge
+    runtime: python
+    plan: starter
+    buildCommand: "python3 -m py_compile server.py"
+    startCommand: "python3 server.py --host 0.0.0.0 --port $PORT --db /var/data/skillforge.db"
+    healthCheckPath: /api/health
+    envVars:
+      - key: SKILLFORGE_DEV
+        value: "0"
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: APP_ORIGIN
+        sync: false
+      - key: SKILLFORGE_DB_PATH
+        value: /var/data/skillforge.db
+      - key: STRIPE_PAYMENT_LINK
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+    disk:
+      name: skillforge-data
+      mountPath: /var/data
+      sizeGB: 5
