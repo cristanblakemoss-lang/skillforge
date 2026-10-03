@@ -1,4 +1,4 @@
-# SkillForge v7
+# SkillForge v8 — launch build
 
 SkillForge is a consumer skill-building product prototype. v7 moves the project from a simple local dashboard toward a deployable service foundation.
 
@@ -86,3 +86,10 @@ The commercial hypothesis is consumer subscription software. Example pricing can
 
 ## v6 public launch
 The project now includes `render.yaml`, `Procfile`, `.gitignore`, production-safe host/port defaults, persistent SQLite configuration, and `DEPLOY_COM.md`. For a first public launch, deploy to Render and attach a custom `.com` domain. Later migrate SQLite to managed Postgres before multi-instance scaling.
+
+
+## v8 launch build
+
+This release is the recommended baseline for public testing. It adds additive SQLite migrations, request-rate limiting for authentication/recovery, email-verification hooks, account deletion, durable Stripe customer/subscription identifiers, and a deployment checklist.
+
+The `.com` domain is configured outside the codebase: register the domain, add it to the Render web service, configure the exact DNS records Render provides, and verify the domain.

@@ -1,45 +1,82 @@
-# SkillForge v6 — put it on a .com
+# SkillForge v8 — public launch checklist
 
-SkillForge is now deployment-ready for a real HTTPS domain, but a `.com` domain itself must be registered and DNS-connected outside this codebase.
+## Current public service
+The existing Render service is reachable at:
 
-## 1. Pick the domain
+https://skillforge-yxyl.onrender.com
 
-`skillforge.com` is already registered, so do not build your launch around that exact domain unless you negotiate to acquire it. Choose a distinct `.com` and verify it at a registrar before paying.
+Before attaching a custom domain, verify `/api/health` returns the expected version and the homepage loads.
 
-Examples to check (availability is not guaranteed):
-- getskillforge.com
-- myskillforge.com
-- skillforgenow.com
-- skillforgepractice.com
+## Render settings
 
-## 2. Put this project in GitHub
+Use the GitHub `main` branch.
+
+Build command:
 
 ```bash
-cd ~/skillforge_v6
-git init
-git add .
-git commit -m "SkillForge v6"
-# create an empty GitHub repository, then add its remote
-git branch -M main
-git push -u origin main
+python3 -m py_compile server.py
 ```
 
-Never commit `.env`, credentials, or `skillforge.db`.
+Start command:
 
-## 3. Deploy on Render
+```bash
+python3 server.py --host 0.0.0.0 --port $PORT --db /var/data/skillforge.db
+```
 
-Create a new Render Blueprint/Web Service from the repository. The included `render.yaml` configures a Python web service, health check, environment variables, and a persistent disk for the current SQLite database.
+Health check:
 
-Set `APP_ORIGIN` to your final HTTPS domain, for example `https://example.com`. Keep `COOKIE_SECURE=1` in production.
+```text
+/api/health
+```
 
-## 4. Connect the .com
+Production environment variables:
 
-In the Render service, add your custom domain. Render then shows the DNS configuration you need to add at the registrar. Render provisions TLS and redirects HTTP to HTTPS.
+```text
+SKILLFORGE_DEV=0
+COOKIE_SECURE=1
+APP_ORIGIN=https://YOUR-DOMAIN.com
+```
 
-## 5. Payments and email
+Do not commit Stripe or SMTP secrets to Git.
 
-Set the Stripe payment link and webhook secret in Render. Configure your email provider before enabling password recovery for real customers.
+## Custom .com
 
-## 6. Important scaling note
+1. Register a `.com` domain with a registrar you control.
+2. In Render, open the SkillForge web service and add the domain under Custom Domains.
+3. Render will show the exact DNS records for that service. Copy those values into the registrar's DNS panel.
+4. Verify the domain in Render.
+5. Render provisions TLS and redirects HTTP to HTTPS.
 
-This v6 package keeps SQLite because it is the smallest path from your Chromebook prototype to a public launch. Render says its filesystem is ephemeral by default, so the Blueprint uses a persistent disk for the database. Persistent disks are single-instance and prevent horizontal scaling; when growth requires multiple instances, migrate the data layer to managed Postgres.
+Do not copy DNS values from an old deployment; use the records Render shows for the current service.
+
+## Production data
+
+The smallest launch path uses SQLite on a persistent disk. For a growing multi-instance service, migrate to managed PostgreSQL. Keep backups and test restore procedures.
+
+## Payments
+
+Configure a real Stripe Payment Link and webhook secret only after the public domain and HTTPS are working. The webhook endpoint is:
+
+```text
+POST /api/stripe/webhook
+```
+
+The server stores Stripe customer/subscription identifiers when available.
+
+## Email
+
+Configure SMTP before enabling public password recovery and email verification. Until then, do not expose development tokens; keep `SKILLFORGE_DEV=0`.
+
+## Launch gate
+
+Before accepting real payments, verify:
+
+- HTTPS works on the custom domain.
+- Email verification works.
+- Password recovery email works.
+- Account deletion works.
+- Data export works.
+- Stripe checkout works.
+- Stripe webhooks update plan state.
+- Database backups exist.
+- Privacy and Terms pages contain your actual business/contact information.

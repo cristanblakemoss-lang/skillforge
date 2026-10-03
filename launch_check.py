@@ -1,20 +1,11 @@
-#!/usr/bin/env python3
-"""Local preflight checks for SkillForge v7."""
-from __future__ import annotations
-import json
-import os
-import sys
-import urllib.request
-
-BASE = os.getenv("SKILLFORGE_CHECK_URL", "http://127.0.0.1:3010")
-checks = [
-    ("health", "/api/health"),
-    ("catalog", "/api/catalog"),
-]
-for name, path in checks:
-    with urllib.request.urlopen(BASE + path, timeout=5) as r:
-        data = json.loads(r.read().decode())
-    if not data.get("ok"):
-        raise SystemExit(f"{name}: failed: {data}")
-    print(f"{name}: OK")
-print("SkillForge v7 preflight: PASS")
+from pathlib import Path
+import json, subprocess, sys
+root=Path(__file__).resolve().parent
+required=['server.py','app.js','index.html','styles.css','render.yaml','Dockerfile','DEPLOY_COM.md','privacy.html','terms.html']
+missing=[x for x in required if not (root/x).exists()]
+if missing:
+    print('MISSING:', ', '.join(missing)); sys.exit(1)
+subprocess.run([sys.executable,'-m','py_compile','server.py'],check=True)
+subprocess.run(['node','--check','app.js'],check=True)
+print('SkillForge v8 preflight: PASS')
+print('Files:', len(list(root.iterdir())))

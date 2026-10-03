@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: skillforge-free-test
+    runtime: python
+    plan: free
+    buildCommand: "python3 -m py_compile server.py"
+    startCommand: "python3 server.py --host 0.0.0.0 --port $PORT"
+    healthCheckPath: /api/health
+    autoDeploy: true
+    envVars:
+      - key: SKILLFORGE_DEV
+        value: "0"
+      - key: COOKIE_SECURE
+        value: "1"
+      - key: APP_ORIGIN
+        sync: false

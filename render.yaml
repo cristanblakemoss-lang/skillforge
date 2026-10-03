@@ -6,6 +6,7 @@ services:
     buildCommand: "python3 -m py_compile server.py"
     startCommand: "python3 server.py --host 0.0.0.0 --port $PORT --db /var/data/skillforge.db"
     healthCheckPath: /api/health
+    autoDeploy: true
     envVars:
       - key: SKILLFORGE_DEV
         value: "0"

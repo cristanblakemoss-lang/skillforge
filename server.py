@@ -26,7 +26,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 DB_PATH = Path(os.getenv("SKILLFORGE_DB_PATH", str(ROOT / "skillforge.db"))).expanduser()
-APP_VERSION = "7.0.0"
+APP_VERSION = "8.0.0"
 SESSION_TTL = int(os.getenv("SESSION_TTL_SECONDS", str(60 * 60 * 24 * 14)))
 RECOVERY_TTL = int(os.getenv("RECOVERY_TTL_SECONDS", str(60 * 30)))
 DEV_MODE = os.getenv("SKILLFORGE_DEV", "1") == "1"
@@ -72,7 +72,9 @@ CREATE TABLE IF NOT EXISTS users (
   created_at INTEGER NOT NULL,
   plan TEXT NOT NULL DEFAULT 'free',
   email_verified INTEGER NOT NULL DEFAULT 0,
-  onboarding_complete INTEGER NOT NULL DEFAULT 0
+  onboarding_complete INTEGER NOT NULL DEFAULT 0,
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT
 );
 CREATE TABLE IF NOT EXISTS profiles (
   user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -124,6 +126,13 @@ CREATE TABLE IF NOT EXISTS sessions (
   created_at INTEGER NOT NULL,
   expires_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS verify_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL,
+  used INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS recovery_tokens (
   token_hash TEXT PRIMARY KEY,
   user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -140,6 +149,8 @@ CREATE TABLE IF NOT EXISTS analytics_events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_user_created ON events(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_analytics_created ON analytics_events(created_at);
+CREATE INDEX IF NOT EXISTS idx_users_stripe_customer ON users(stripe_customer_id);
+
 """
 
 
@@ -157,6 +168,12 @@ def db() -> sqlite3.Connection:
 def init_db() -> None:
     with db() as conn:
         conn.executescript(SCHEMA)
+        # Lightweight compatibility migrations for databases created by v7.
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "stripe_customer_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_customer_id TEXT")
+        if "stripe_subscription_id" not in cols:
+            conn.execute("ALTER TABLE users ADD COLUMN stripe_subscription_id TEXT")
         conn.commit()
 
 
@@ -342,6 +359,29 @@ def update_rep(user_id, skill_id, minutes, xp, mission_name):
         conn.commit()
 
 
+def send_verify_email(to_email: str, token: str) -> bool:
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "")
+    from_email = os.getenv("SMTP_FROM", username).strip()
+    base = os.getenv("APP_ORIGIN", "http://127.0.0.1:3010").rstrip("/")
+    link = f"{base}/#verify?token={urllib.parse.quote(token)}"
+    if not host or not from_email:
+        return False
+    msg = EmailMessage()
+    msg["Subject"] = "Verify your SkillForge email"
+    msg["From"] = from_email
+    msg["To"] = to_email
+    msg.set_content("Verify your SkillForge email:\n\n" + link + "\n\nThis link expires soon.")
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.starttls()
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(msg)
+    return True
+
+
 def send_recovery_email(to_email: str, token: str) -> bool:
     host = os.getenv("SMTP_HOST", "").strip()
     port = int(os.getenv("SMTP_PORT", "587"))
@@ -381,6 +421,32 @@ def stripe_signature_valid(payload: bytes, signature: str, secret: str) -> bool:
         return any(hmac.compare_digest(expected, v) for v in pieces.get("v1", []))
     except Exception:
         return False
+
+
+RATE_BUCKETS = {}
+RATE_WINDOWS = {
+    "auth": (10, 300),
+    "recovery": (5, 600),
+}
+
+def client_ip(handler):
+    return handler.headers.get("X-Forwarded-For", "").split(",")[0].strip() or handler.client_address[0]
+
+def rate_limited(handler, bucket):
+    limit, window = RATE_WINDOWS[bucket]
+    key = (bucket, client_ip(handler))
+    stamp = time.time()
+    items = [t for t in RATE_BUCKETS.get(key, []) if stamp - t < window]
+    if len(items) >= limit:
+        RATE_BUCKETS[key] = items
+        return True
+    items.append(stamp)
+    RATE_BUCKETS[key] = items
+    return False
+
+def ensure_columns():
+    # SQLite migration helper; schema upgrades are intentionally additive.
+    pass
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -480,13 +546,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 event_type = str(data.get("type") or "")
                 obj = (((data.get("data") or {}).get("object")) or {})
                 email = clean_email(obj.get("customer_email") or obj.get("email") or "")
-                if email:
-                    with db() as conn:
-                        if event_type in {"checkout.session.completed", "customer.subscription.created", "customer.subscription.updated"}:
-                            conn.execute("UPDATE users SET plan='plus' WHERE email=?", (email,))
-                        elif event_type in {"customer.subscription.deleted"}:
-                            conn.execute("UPDATE users SET plan='free' WHERE email=?", (email,))
-                        conn.commit()
+                customer_id = str(obj.get("customer") or "").strip()
+                subscription_id = str(obj.get("subscription") or (obj.get("id") if event_type.startswith("customer.subscription.") else "") or "").strip()
+                with db() as conn:
+                    if event_type == "checkout.session.completed":
+                        email = email or clean_email(((obj.get("customer_details") or {}).get("email")) or "")
+                        if email:
+                            conn.execute("UPDATE users SET plan='plus',stripe_customer_id=?,stripe_subscription_id=? WHERE email=?", (customer_id or None, subscription_id or None, email))
+                    elif event_type in {"customer.subscription.created", "customer.subscription.updated"}:
+                        if customer_id:
+                            conn.execute("UPDATE users SET plan='plus',stripe_customer_id=?,stripe_subscription_id=? WHERE stripe_customer_id=? OR email=?", (customer_id, subscription_id or None, customer_id, email))
+                        elif email:
+                            conn.execute("UPDATE users SET plan='plus',stripe_subscription_id=? WHERE email=?", (subscription_id or None, email))
+                    elif event_type == "customer.subscription.deleted":
+                        if customer_id:
+                            conn.execute("UPDATE users SET plan='free',stripe_subscription_id=NULL WHERE stripe_customer_id=?", (customer_id,))
+                        elif email:
+                            conn.execute("UPDATE users SET plan='free',stripe_subscription_id=NULL WHERE email=?", (email,))
+                    conn.commit()
                 return self.send_json({"ok": True})
             except ValueError as e:
                 self.send_json({"ok": False, "error": str(e)}, 400); return
@@ -500,11 +577,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             if path == "/api/register":
+                if rate_limited(self, "auth"):
+                    self.send_json({"ok": False, "error": "Too many signup/login attempts. Try again later."}, 429); return
                 email = clean_email(data.get("email")); name = clean_name(data.get("name")); password = str(data.get("password") or "")
                 user_id = create_user(email, name, password)
                 csrf = new_session(self, user_id)
+                token = secrets.token_urlsafe(32)
+                with db() as conn:
+                    conn.execute("INSERT INTO verify_tokens(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)", (hash_token(token), user_id, now(), now() + 86400))
+                    conn.commit()
+                try:
+                    sent = send_verify_email(email, token)
+                except Exception:
+                    sent = False
                 analytics(user_id, "account_created", {})
-                self.send_json({"ok": True, "csrf": csrf, "state": user_state(user_id)}); return
+                payload = {"ok": True, "csrf": csrf, "state": user_state(user_id), "verification_prepared": True}
+                if DEV_MODE and not sent:
+                    payload["dev_verify_token"] = token
+                self.send_json(payload); return
 
             if path == "/api/demo":
                 email = "demo@skillforge.local"
@@ -521,6 +611,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json({"ok": True, "csrf": csrf, "state": user_state(user_id)}); return
 
             if path == "/api/login":
+                if rate_limited(self, "auth"):
+                    self.send_json({"ok": False, "error": "Too many signup/login attempts. Try again later."}, 429); return
                 email = clean_email(data.get("email")); password = str(data.get("password") or "")
                 with db() as conn:
                     row = conn.execute("SELECT id,password_hash FROM users WHERE email=?", (email,)).fetchone()
@@ -535,7 +627,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if sess: analytics(sess["user_id"], "logout", {}); clear_session(self); self.send_json({"ok": True})
                 return
 
+            if path == "/api/verify/request":
+                email = clean_email(data.get("email"))
+                with db() as conn:
+                    user = conn.execute("SELECT id,email,email_verified FROM users WHERE email=?", (email,)).fetchone()
+                    if user and not user["email_verified"]:
+                        token = secrets.token_urlsafe(32)
+                        conn.execute("INSERT INTO verify_tokens(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)", (hash_token(token), user["id"], now(), now() + 86400))
+                        conn.commit()
+                        try:
+                            sent = send_verify_email(user["email"], token)
+                        except Exception:
+                            sent = False
+                        response = {"ok": True, "message": "Verification instructions prepared."}
+                        if DEV_MODE and not sent:
+                            response["dev_verify_token"] = token
+                        self.send_json(response); return
+                self.send_json({"ok": True, "message": "Verification instructions prepared."}); return
+
+            if path == "/api/verify":
+                token = str(data.get("token") or "")
+                with db() as conn:
+                    row = conn.execute("SELECT user_id FROM verify_tokens WHERE token_hash=? AND used=0 AND expires_at>?", (hash_token(token), now())).fetchone()
+                    if not row:
+                        self.send_json({"ok": False, "error": "Verification token is invalid or expired."}, 400); return
+                    conn.execute("UPDATE users SET email_verified=1 WHERE id=?", (row["user_id"],))
+                    conn.execute("UPDATE verify_tokens SET used=1 WHERE token_hash=?", (hash_token(token),))
+                    conn.commit()
+                self.send_json({"ok": True, "message": "Email verified."}); return
+
             if path == "/api/recovery/request":
+                if rate_limited(self, "recovery"):
+                    self.send_json({"ok": True, "message": "If the account exists, recovery instructions were prepared."}); return
                 email = clean_email(data.get("email"))
                 with db() as conn:
                     user = conn.execute("SELECT id,email FROM users WHERE email=?", (email,)).fetchone()
@@ -690,6 +813,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if name:
                     analytics(user_id, name, props)
                 self.send_json({"ok": True}); return
+
+            if path == "/api/account/delete":
+                password = str(data.get("password") or "")
+                with db() as conn:
+                    row = conn.execute("SELECT password_hash FROM users WHERE id=?", (user_id,)).fetchone()
+                    if not row or not check_password(password, row["password_hash"]):
+                        self.send_json({"ok": False, "error": "Password is incorrect."}, 401); return
+                    conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+                    conn.commit()
+                clear_session(self)
+                self.send_json({"ok": True, "message": "Account deleted."}); return
 
             if path == "/api/export":
                 self.send_json({"ok": True, "exported_at": now(), "state": user_state(user_id)}); return
